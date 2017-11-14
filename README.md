@@ -1,2 +1,2 @@
 # AtRTD2-DE-DAS-DTU-pipeline
-![](https://github.com/wyguo/AtRTD2-DE-DAS-DTU-pipeline/blob/master/DE DAS DTU pipeline of AtRTD2 RNA-seq.png)
+![](https://github.com/wyguo/TSIS/blob/master/vignettes/fig/figures_001.png)
