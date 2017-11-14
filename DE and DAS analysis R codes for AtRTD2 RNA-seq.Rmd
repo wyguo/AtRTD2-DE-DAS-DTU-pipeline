@@ -1,0 +1,1738 @@
+---
+title: "DE and DAS analysis R codes for AtRTD2 RNA-seq"
+author: "Wenbin Guo"
+date: "5 October 2017"
+output:
+  html_document:
+    code_folding: show
+    fig_caption: yes
+    highlight: textmate
+    theme: cerulean
+    toc: yes
+    toc_depth: 4
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+  word_document:
+    toc: yes
+    toc_depth: '4'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,eval = F)
+```
+
+# Load library
+
+```{r cars}
+.libPaths('D:/R/win-library')
+library(edgeR)
+library(limma)
+library(tximport)
+library(FactoMineR)
+library(factoextra)
+library(RUVSeq)
+library(ggplot2)
+library(TSIS)
+library(circlize)
+library(ComplexHeatmap)
+library(RDAVIDWebService)
+library(WGCNA)
+library(tibble)
+```
+
+# Data pre-processing
+
+## Generate read counts and TPM
+Based on the transcript read counts and TPM extracted from the Salmon output, "lengthScaledTPM" method in R package tximport version 0.99.2 was used to estimate the transcript and gene level expression profiles (Soneson et al., 2015).
+
+
+```{r}
+##################################################################################Start
+# ▀▀█▀▀ ▀▄░▄▀ ▀█▀ ░█▀▄▀█ ░█▀▀█ ░█▀▀▀█ ░█▀▀█ ▀▀█▀▀ 
+# ─░█── ─░█── ░█─ ░█░█░█ ░█▄▄█ ░█──░█ ░█▄▄▀ ─░█── 
+# ─░█── ▄▀░▀▄ ▄█▄ ░█──░█ ░█─── ░█▄▄▄█ ░█─░█ ─░█── 
+##---------------------------implement tximport analysiX----------------------------##
+
+#load data file names
+files<-list.files('data/salmon_RTD2_padding_21April2017/',
+                  pattern = 'salmon_RTD2_padding')
+load("data/s2c0.RData")
+files<-s2c0$path
+files<-paste0('data/salmon_RTD2_padding_21April2017/',files,'/quant.sf')
+quant <- read.delim("data/salmon_RTD2_padding_21April2017/salmon_RTD2_padding_792_LIB5944_LDI4760_GATCAG_L001_R/quant.sf")
+##trans
+trans<-as.vector(quant$Name)
+genes<-substr(trans,1,9)
+trans2genes<-data.frame(TXNAME=trans,GENEID=genes)
+
+##samples
+times<-paste0('T',rep(1:26,each=9))
+bioreps<-paste0('biorep',rep(rep(1:3,each=3),26))
+techreps<-paste0('techrep',rep(rep(1:3,3),26))
+sample.names<-paste0(times,'_',bioreps,'_',techreps)
+
+###gene level simply add up transcripts level
+txi_genes_lengthScaledTPM <- tximport(files, type = "salmon", 
+                                      tx2gene = trans2genes, countsFromAbundance = "lengthScaledTPM")
+colnames(txi_genes_lengthScaledTPM$counts)<-sample.names
+colnames(txi_genes_lengthScaledTPM$abundance)<-sample.names
+save(txi_genes_lengthScaledTPM,file='data/txi_genes_lengthScaledTPM.RData')
+
+###transcript level
+txi_trans<- tximport(files, type = "salmon", tx2gene = NULL, 
+                     countsFromAbundance = "lengthScaledTPM",txOut = T)
+colnames(txi_trans$counts)<-sample.names
+colnames(txi_trans$abundance)<-sample.names
+save(txi_trans,file='data/txi_trans.RData')
+####################################################################
+```
+
+
+## Sum up sequencing replicates
+The technical (sequencing) replicates were run in the same batches/lanes, we summed up technical replicates to increase the read depth, yielding 78 samples of 26 time points and 3 biological replicates. 
+
+```{r}
+idx<-colnames(txi_genes_lengthScaledTPM$counts)
+idx<-do.call(rbind,strsplit(idx,'_'))
+idx<-paste0(idx[,1],'_',idx[,2])
+
+#self-defined function sumarrays
+est_genes_counts_lengthScaledTPM<-sumarrays(txi_genes_lengthScaledTPM$counts,group = idx)
+est_trans_counts<-sumarrays(txi_trans$counts,group = idx)
+est_genes_TPM_lengthScaledTPM<-sumarrays(txi_genes_lengthScaledTPM$abundance,group = idx)
+est_trans_TPM<-sumarrays(txi_trans$abundance,group = idx)
+
+
+save(est_genes_counts_lengthScaledTPM,file='data/est_genes_counts_lengthScaledTPM.RData')
+save(est_trans_counts,file='data/est_trans_counts.RData')
+save(est_genes_TPM_lengthScaledTPM,file='data/est_genes_TPM_lengthScaledTPM.RData')
+save(est_trans_TPM,file='data/est_trans_TPM.RData')
+```
+
+## Filter low expressed transcripts
+Low expressed transcripts were filtered based on counts per million (CPM). An expressed transcript must have 3 or more samples out of 78  ≥ 1 CPM. The cut-off was optimally determined by the data mean-variance relationship (Law et al., 2016). Low expressed genes were the genes with only low expressed transcripts.
+
+```{r}
+##Filtering low expressed transcripts##
+trans<-rownames(est_trans_counts)
+genes<-unique(substr(trans,1,9))
+filter.idx<-edgeR_filter(est_trans_counts,cutoff = 3)
+
+table(filter.idx)
+trans_high<-names(filter.idx)[filter.idx==T]
+genes_high<-unique(substr(trans_high,1,9))
+save(trans_high,file='data/trans_high.RData')
+save(genes_high,file='data/genes_high.RData')
+```
+
+## Remove batch effect
+The residual methods in RUVSeq package was used to estimate the batch effects of the biological replicates (Leek, 2014; Jeffrey T. Leek et al., 2012; Jeffrey T Leek et al., 2012).
+
+```{r}
+load('data/sample.RData')
+sample<-sample[seq(1,234,by=3),]
+btime<-paste0(sample$block_,'.',sample$time_)
+btime<-factor(btime,levels = unique(btime))
+
+####################################################################
+##batch for gene level lengthScaledTPM
+dat0<-est_genes_counts_lengthScaledTPM
+idx_high<-genes_high
+group<-sample$time
+
+dat0<-dat0[idx_high,]
+###design matrix
+design<-model.matrix(~0+btime)
+colnames(design)<-idx_refine(colnames(design))
+batch_free<-remove_batch(dat0=dat0,design=design,group=group)
+
+batch_genes_lengthScaledTPM<-batch_free
+save(batch_genes_lengthScaledTPM,file='data/batch_genes_lengthScaledTPM.RData')
+
+####################################################################
+##batch for transcripts level
+dat0<-(est_trans_counts)
+idx_high<-trans_high
+group<-sample$time
+
+dat0<-dat0[idx_high,]
+###design matrix
+design<-model.matrix(~0+btime)
+colnames(design)<-idx_refine(colnames(design))
+batch_free<-remove_batch(dat0=dat0,design=design,group=group)
+
+batch_trans<-batch_free
+save(batch_trans,file='data/batch_trans.RData')
+```
+
+## PCA plot
+```{r}
+####################################################################
+##PCA plot
+##prepare the data
+counts_batchfree<-batch_genes_lengthScaledTPM$normalizedCounts
+dge_genes_lengthScaledTPM <- DGEList(counts=(counts_batchfree)[genes_high,],
+                                     group = sample$time)
+dge_genes_lengthScaledTPM<- calcNormFactors(dge_genes_lengthScaledTPM)
+genes_lengthScaledTPM_voom_batchfree<-voom(dge_genes_lengthScaledTPM,design,plot=F)
+
+##make plot
+data2pca<-data.frame(t((genes_lengthScaledTPM_voom_batchfree$E)))
+data2pca<-TSIS::rowmean(x =data2pca,group = paste0('T',rep(1:26,each=3)) )
+
+days<-c(rep('20 Degree',9), rep('4 Degree Day 1',8),rep('4 Degree Day 4',9))
+##pc1 vs pc2
+p<-plot_PCA(data2pca = data2pca,groups = days,addEllipses = F,color.values = gg_color_hue(3),shape = 16:18)
+print(p+ylim(c(-100,150)))
+```
+
+
+# DE and DAS analysis
+
+## Limma voom
+To normalize the expression profiles to make different samples have similar distribution, the limma-edgeR pipeline was used (Law et al., 2014, 2016). The read counts in gene and transcripts levels were transformed into log-counts per million (log-CPM) by normalising on the library size using limma package version 3.26.9 (Ritchie et al., 2015) and the library size of each sample was pre-scaled by a normalisation factor estimated across the samples, which aims to reduce the false positives caused by the composition of gene expression in the samples (high expressed genes dominate the library, an example to make the my points clear: G1 and G2 are expressed in sample 1. G1 doesn’t change but G2 is not expressed in sample 2. If the sequence depths are the same for two samples, the expression of G1 in sample 2 is twice as much as that in sample 1. The no change G1 might be predicted as a DE gene between sample 1 and sample 2), using TMM (trimmed mean of M values) method in edgeR package version 3.12.1 (Robinson et al., 2010).
+
+## Contrast groups
+```{r}
+samples<-samples[seq(1,234,by=3),]
+btime<-paste0(samples$block_,'.',samples$time_)
+btime<-factor(btime,levels = unique(btime))
+
+##contrast group
+idx1<-paste0('block',rep(2:3,each=9))
+idx2<-paste0('T',1:9)
+idx3<-rep('block1',18)
+contrast<-paste0(paste0(idx1,'.',rep(idx2,2)),'-',paste0(idx3,'.',rep(idx2,2)))
+contrast[1]<-'block1.T9-block1.T1'
+# contrast<-contrast[-1]
+```
+
+
+## DE at gene level
+```{r}
+####################################################################
+##Gene level lengthScaledTPM
+##design matrix
+batch_effect<-batch_genes_lengthScaledTPM$W
+design<-model.matrix(~0+btime+batch_effect)
+colnames(design)<-idx_refine(colnames(design))
+
+##edgR norm factors
+dge_genes <- DGEList(counts=(est_genes_counts_lengthScaledTPM)[genes_high,],
+                     group = sample$time)
+dge_genes<- calcNormFactors(dge_genes)
+
+start.time <- Sys.time()
+adjust.method = 'BH'
+DE_results_genes_lengthScaledTPM<-AtRTD2DE(dge = dge_genes,targets =genes_high ,
+                                           design = design,contrast = contrast,splice.model = F,
+                                           adjust.method = adjust.method)
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+save(DE_results_genes_lengthScaledTPM,file='data/DE_results_genes_lengthScaledTPM.RData')
+```
+
+## DE at transcript level $\Rightarrow$ DAS genes/transcripts
+```{r}
+####################################################################
+##Transcript level lengthScaledTPM
+##design matrix
+load('data/sample.RData')
+sample<-sample[seq(1,234,by=3),]
+btime<-paste0(sample$block_,'.',sample$time_)
+btime<-factor(btime,levels = unique(btime))
+
+##contrast group
+idx1<-paste0('block',rep(2:3,each=9))
+idx2<-paste0('T',1:9)
+idx3<-rep('block1',18)
+contrast<-paste0(paste0(idx1,'.',rep(idx2,2)),'-',paste0(idx3,'.',rep(idx2,2)))
+contrast[1]<-'block1.T9-block1.T1'
+# contrast<-contrast[-1]
+
+##Transcripts level DE analysis
+###design matrix
+batch_effect<-batch_trans$W
+design<-model.matrix(~0+btime+batch_effect)
+colnames(design)<-idx_refine(colnames(design))
+
+##edgR norm factors
+dge_trans <- DGEList(counts=(est_trans_counts)[trans_high,],group = sample$time,genes = data.frame(GeneID=substr(trans_high,1,9),TransID=trans_high))
+dge_trans<- calcNormFactors(dge_trans)
+
+start.time <- Sys.time()
+adjust.method = 'BH'
+DE_results_trans<-AtRTD2DE(dge = dge_trans,targets =trans_high ,
+                            design = design,contrast = contrast,splice.model = T,
+                           geneid="GeneID",adjust.method = adjust.method,FDR = 0.01,pval = 1)
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+
+save(DE_results_trans,file='data/DE_results_trans.RData')
+```
+
+## Summary the DE and DAS results
+
+### DE genes
+```{r}
+DE_DAS_results <- list()
+######################################################################
+##---DE genes indicator
+pval <- DE_results_genes_lengthScaledTPM$results_pval_ind[,1:18]
+LFC <- DE_results_genes_lengthScaledTPM$results_pval_overall[,1:18]
+LFC <- LFC[rownames(LFC),]
+LFC.sign <- sign(LFC)
+colnames(LFC)
+
+##---DE genes
+indicator <- (pval<=0.01)+(abs(LFC)>=1)
+indicator[indicator==1] <- 0
+indicator <- indicator/2
+indicator[1:10,1:3]
+colSums(indicator)
+idx<-apply(indicator[,-1],1,function(x) value.counts(x,value = 1,consecutive = T))
+DE_genes<-names(idx)[idx]
+length(DE_genes)
+
+DE_DAS_results$DE_genes_indicator <- indicator
+DE_DAS_results$DE_genes <- DE_genes
+DE_DAS_results$DAS_genes <- DE_summary$DAS_genes
+```
+
+### DE transcripts
+```{r}
+######################################################################
+##---DE trans indicator
+pval <- DE_results_trans$results_pval_ind[,1:18]
+LFC <- DE_results_trans$results_pval_overall[,-c(1:2)][,1:18]
+LFC <- LFC[rownames(LFC),]
+LFC.sign <- sign(LFC)
+colnames(LFC)
+
+##---DE transcripts
+indicator <- (pval<=0.01)+(abs(LFC)>=1)
+indicator[indicator==1] <- 0
+indicator <- indicator/2
+indicator[1:10,1:3]
+colSums(indicator)
+idx<-apply(indicator[,-1],1,function(x) value.counts(x,value = 1,consecutive = T))
+DE_trans<-names(idx)[idx]
+length(DE_trans)
+
+DE_DAS_results$DE_trans_indicator <- indicator
+DE_DAS_results$DE_trans <- DE_trans
+```
+
+### DAS transcripts
+```{r}
+######################################################################
+##---delta PSI
+idx1<-1:9
+idx2<-9:17
+idx3<-18:26
+TPM.mean<-t(TSIS::rowmean(t(txi_trans$abundance[trans_high,]),
+                          group = rep(1:26,each=9)))
+##PSI
+PSI <- TSIS::rowratio(TPM.mean,group = substr(rownames(TPM.mean),1,9))
+deltaPSI <- abs(PSI[,c(idx2,idx3)]-PSI[,c(idx1,idx1)])
+
+##---generate indicator
+pval <- DE_results_trans$pval_DAS_ind
+deltaPSI <- deltaPSI[rownames(pval),]
+indicator <- (pval<0.01)+(abs(deltaPSI)>0.1)
+indicator[indicator==1] <- 0
+indicator <- indicator/2
+indicator[1:10,1:3]
+colSums(indicator)
+
+##---DAS transcripts
+idx<-apply(indicator[,-1],1,function(x) value.counts(x,value = 1,consecutive = T))
+DAS_trans<-names(idx)[idx]
+length(DAS_trans)
+
+DE_DAS_results$DAS_trans_indicator <- indicator
+DE_DAS_results$DAS_genes_indicator <- DAS_indicator
+DE_DAS_results$DAS_trans <- DAS_trans
+save(DE_DAS_results,file='data/DE_DAS_results.RData')
+
+######
+# trans.idx <- rownames(DE_results_trans$DAS.list.t[[1]])
+# pval <- lapply(names(DE_results_trans$DAS.list.t),function(i){
+#   x <- DE_results_trans$DAS.list.t[[i]]
+#   y <- data.frame(pval=x$FDR)
+#   rownames(y) <- rownames(x)
+#   y <- y[trans.idx,]
+#   y
+# })
+# 
+# pval <- do.call(cbind,pval)
+# colnames(pval) <- names(DE_results_trans$DAS.list.t)
+# rownames(pval) <- trans.idx
+# head(pval)
+
+```
+
+
+# TSIS analysis
+
+```{r}
+###################################################################
+##------------For DAS genes with all expressed transcirpts-------##
+idx <-table(substr(trans_high,1,9))
+genes_2trans <- names(idx)[idx>1]
+length(genes_2trans)
+
+label <- 'DAS_all'
+trans <- DE_summary$TSIS_trans
+# idx.max <- apply(PSI,1,max)
+# idx.max <-rownames(PSI)[idx.max>=0.2]
+# trans <- intersect(trans,idx.max)
+
+genes<-DE_summary$DAS_genes
+length(genes)
+length(intersect(genes,genes_2trans))
+
+genes.idx<-substr(trans,1,9)
+idx<-which(genes.idx %in% genes)
+trans<-trans[idx]
+length(trans)
+
+mapping<-data.frame(genes=substr(trans,1,9),trans=trans)
+head(mapping)
+data.exp<-txi_trans$abundance[as.vector(unlist(mapping$trans)),]
+
+idx1<-paste0('rep',rep(1:9,26))
+idx2<-rep(1:26,each=9)
+idx3<-c('replicates','time',rownames(data.exp))
+x<-rbind.data.frame(idx1,idx2,data.exp)
+x<-cbind.data.frame(idx3,x)
+data.exp<-x
+
+##double check
+length(unique(substr(trans,1,9)))
+table(table(substr(trans,1,9))>1)
+
+write.table(data.exp,file=paste0('results/data.exp.',label,'.csv'),row.names = F,col.names = F,sep=',')
+write.table(mapping,file=paste0('results/mapping.',label,'.csv'),quote = F,row.names = F,col.names = T,sep = ',')
+
+###################################################################
+##TSIS analysis
+TSIS::TSIS.app()
+```
+
+# Heatmap of DAS transcripts
+```{r}
+## Filter the DAS transcripts
+load('data/DE_DAS_results.RData')
+load('data/txi_trans.RData')
+DAS_genes <- DE_DAS_results$DAS_genes
+DAS_trans <- DE_DAS_results$DAS_trans
+length(DAS_trans)
+length(DAS_genes)
+##DAS transcripts of DAS genes
+idx <- which(substr(DAS_trans,1,9) %in% DAS_genes)
+DAS_trans <- DAS_trans[idx]
+length(DAS_trans)
+DE_DAS_results$DAS_trans_in_DAS_genes <- DAS_trans
+```
+```{r}
+###traints
+days<-c(rep('20 Degree',9), rep('4 Degree Day 1',8),rep('4 Degree Day 4',9))
+light<-sunset <- sunrise <- rep(0,26)
+light[c(1,6:9,14:18,23:26)] <- 1
+dark<-1-light
+sunset[c(1,9,17,18,26)]<-1
+sunrise[c(5,13,22)]<-1
+traits<-data.frame(days=c(rep(0,9),rep(1,8),rep(4,9)),
+                   temperature=c(rep(20,9),rep(4,8),rep(4,9)),
+                   light=light,dark=dark,sunset=sunset,sunrise=sunrise)
+
+ann<-data.frame(day=c(
+  rep('20_Day0',9),
+  rep('4_Day1',8),
+  rep('4_Day4',9)
+))
+##annotaion 
+color2day<-gg_color_hue(4)
+ha = HeatmapAnnotation(ann,col = list(day = c("20_Day0"=color2day[1],
+                                              "4_Day1"=color2day[2],
+                                              "4_Day4"=color2day[3])),
+                       show_legend = F,   
+                       annotation_name_rot=0)
+leg<-rowAnnotation(ann,col = list(day = c("20_Day0"=color2day[1],
+                                          "4_Day1"=color2day[2],
+                                          "4_Day4"=color2day[3])),
+                   show_legend = T,
+                   width = unit(0, "cm"))
+
+
+###--Build basic of wgcna---###
+rm('data2plot')
+# DAS_trans <- DE_summary$TSIS_trans_cut0.2
+length(DAS_trans)
+data2plot<-txi_trans$abundance[DAS_trans,]
+##take average of replicates for each gene
+data2plot<-TSIS::rowmean(t(data2plot),group=rep(1:26,each=9))
+# data2plot<-apply(data2plot,2,function(x) (x-mean(x))/sd(x))
+data2plot<-apply(data2plot,2,scale)
+dim(data2plot)
+i=100
+set.seed(1000)
+# ###------------------wgcna basic------------------#########
+# wgcna_clusters_DAStrans0<-wgcna.analysis(
+#   object = NULL,
+#   data2wgcna=data2plot,
+#   powers=NULL,
+#   minModuleSize = i,
+#   zscore=T,
+#   pca.scale=T,
+#   traits=NULL,
+#   hclust.method='average',
+#   tom.plot=F,
+#   scaled=T,
+#   merge.cluster=T,
+#   merge.threshold = 0.2,
+#   label=paste0('wgcna_DAS_trans_minsize',i),
+#   pamStage = T,
+#   cor.analysis = F,
+#   figure.folder = paste0('figure/wgcna_DAS_trans_minsize_',i),
+#   save.input = T,
+#   onlysft = T
+# )
+# save(wgcna_clusters_DAStrans0,file='data/wgcna_clusters_DAStrans_20171004.RData')
+
+data2plot<-t(data2plot)
+colnames(data2plot)<-1:26
+
+###---wgcna---###
+# load('data/wgcna_clusters_DAStrans0.RData')
+
+merge.threshold=0.1
+folder=paste0('figure/wgcna_DAS_trans_minsize_',i,'_merge.thres_',merge.threshold)
+
+cluster_results<-list()
+message(paste0('WGCNA analysis: min module size=',i,'...'))
+  
+#########------------------wgcna------------------#########
+##minimum moudle size
+set.seed(1000)
+x<-wgcna.analysis(
+  object = wgcna_clusters_DAStrans0,
+  data2wgcna=t(data2plot),
+  powers=NULL,
+  minModuleSize = i,
+  zscore=F,
+  pca.scale=T,
+  traits=traits,
+  hclust.method='average',
+  merge.hclust.method = 'single',
+  tom.plot=F,
+  scaled=T,
+  merge.cluster=T,
+  merge.threshold = merge.threshold,
+  label=paste0('wgcna_DAS_trans_minsize',i),
+  pamStage = T,
+  cor.analysis = F,figure.folder = folder,save.input = F,
+  onlysft = F
+)
+
+cluster_results$wgcna<-x
+
+###---make the heatmap---###
+set.seed(1000)
+cluster1<-x$cluster.idx$new.cluster.cluster
+names(cluster1) <- x$cluster.idx$target
+length(cluster1)
+table(cluster1)
+unique(table(cluster1))
+y <- plot.heatmap(data2plot=data2plot,
+                  ha=ha,leg=leg,
+                  label='DAS trans TPM',folder=folder,
+                  split=(cluster1),
+                  col=colorRamp2(c(-3, 0, 4), c("blue", "white", "red")),
+                  dis.method='pearson',
+                  cluster.method='average'
+)
+cluster_results$heatmap<-y
+
+###GO
+set.seed(1000)
+idx<-unique(sort(cluster1))
+# i <- idx[1]
+z<-lapply(idx,function(j){
+  message(paste0('Processing Cluster ',j))
+  genes2ann<-unique(substr(names(cluster1)[cluster1==j],1,9))
+  length(genes2ann)
+  FunAnn<-gene2GO(genes2ann = genes2ann,timeOut = 800000)
+  g<-Go2plot(FunAnn = FunAnn,gene.group = paste0('Cluster',j),
+             BP.n = 3,MF.n = 3,CC.n = 3,str.length.cut = 50)
+  save.figure(g,file=paste0(folder,'/DAS Cluster ',j),
+              width = 5,height =max(length(unique(g$data$Term))/2,1.2),units = 'in',res = 600)
+  # print(g)
+  # dev.off()
+  return(FunAnn)
+}
+)
+names(z)<-paste0('DAS_Clusters',idx)
+cluster_results$GO<-z
+
+
+#################################################################
+###plot the average expression profiles of each cluster
+
+###take the clusters
+
+
+x <- cluster_results$wgcna
+cluster1<-x$cluster.idx$new.cluster.cluster
+names(cluster1) <- x$cluster.idx$target
+cluster1 <- sort(cluster1,decreasing = F)
+cluster1 <- cluster1[cluster1>0]
+
+data2plot <- data2plot[names(cluster1),]
+dim(data2plot)
+colnames(data2plot) <- 1:26
+
+###---arange data
+y <- by(data2plot,INDICES = as.vector(cluster1),FUN = function(x){
+  y1 <- apply(x,2,mean)
+  y2 <- apply(x,2,function(i) stderr(i,error.type = 'sd'))
+  data.frame(mean=y1,sderr=y2)
+})
+names(y) <- paste0('cluster ',unique(cluster1))
+y <- data.frame(clusters=rep(paste0('cluster ',unique(cluster1)),each=26),times=1:26,
+                do.call(rbind,y),row.names = NULL)
+
+q <- list()
+for(i in unique(y$clusters)){
+z <- droplevels(subset(y,clusters==i))
+# z <- y
+g <- ggplot(data = z ,aes(x=times,y=mean))+geom_line(stat = 'identity',size=0.8)+
+  geom_ribbon(aes(ymin=mean-sderr,ymax=mean+sderr,fill=1),alpha=0.4)+
+  # geom_errorbar(aes(ymin=mean-sderr,ymax=mean+sderr,fill=1),alpha=0.4)+
+  theme_bw()+
+  labs(title=i,y='',x='')+
+  theme(legend.position = 'none',panel.grid = element_blank())+
+  scale_x_continuous(breaks = seq(0,26,by=2))
+if(i=='cluster 1')
+  g <- g+labs(y='z-score',x='time-points')
+q <- c(q,list(g))
+}
+
+
+pdf(paste0(folder,'/DAS genes mean profile of cluster on s.pdf'),width = 12,height = 7)
+do.call(gridExtra::grid.arrange,c(q,ncol=4))
+dev.off()
+
+pdf(paste0(folder,'/DAS genes mean profile of cluster on s2.pdf'),width = 8,height = 6)
+do.call(gridExtra::grid.arrange,c(q,ncol=3))
+dev.off()
+
+
+cluster_results_DAS_trans_TPM<-cluster_results
+save(cluster_results_DAS_trans_TPM,file=paste0(folder,'/cluster_results_DAS_trans_TPM.RData'))
+##---write the names in clusters to file---##
+##generate csv table for individuals in each clusters
+cluster.member <- split(as.vector(x$cluster.idx$target),x$cluster.idx$new.cluster.cluster)
+names(cluster.member) <- paste0('Cluster',names(cluster.member))
+cluster.member <- plyr::ldply(cluster.member, rbind)
+rownames(cluster.member)<-cluster.member[,1]
+cluster.member<-cluster.member[,-1]
+cluster.member<-data.frame(t(cluster.member))
+colnames(cluster.member)
+write.csv(cluster.member,file = paste0(folder,'/cluster_member.csv'),
+          row.names = F,na = "")
+
+
+###write Go of clusters
+
+# load('figure/wgcna_DAS_trans_minsize_100_merge.thres_0.2/cluster_results_DAS_trans_TPM.RData')
+x <- lapply(names(cluster_results_DAS_trans_TPM$GO),function(x){
+  tibble::add_column(data.frame(cluster_results_DAS_trans_TPM$GO[[x]],row.names = NULL),cluster=x,.before = 1)
+})
+
+y <- do.call(rbind,x)
+write.csv(y,paste0(folder,'/GO of clusters of DAS genes.csv'),row.names = F)
+
+
+```
+
+# References
+
+- Benjamini,Y. and Hochberg,Y. (1995) Controlling the false discovery rate: a practical and powerful approach to multiple testing. In, Journal of the Royal Statistical Society Series B (Methodological).
+- Fresno,C. and Fernández,E.A. (2013) RDAVIDWebService: A versatile R interface to DAVID. Bioinformatics, 29, 2810–2811.
+- Gu,Z. et al. (2016) Complex heatmaps reveal patterns and correlations in multidimensional genomic data. Bioinformatics, 32, 2847–2849.
+- Huang,D.W. et al. (2009) Bioinformatics enrichment tools: Paths toward the comprehensive functional analysis of large gene lists. Nucleic Acids Res., 37, 1–13.
+- Kassambara,A. and Mundt,F. (2017) factoextra: Visualization of the outputs of a multivariate analysis. R Package version 1.0. 4.
+- Langfelder,P. and Horvath,S. (2008) WGCNA: an R package for weighted correlation network analysis. BMC Bioinformatics, 9, 559.
+- Law,C. et al. (2016) RNA-seq analysis is easy as 1-2-3 with limma, Glimma and edgeR. F1000Research, 5.
+- Law,C.W. et al. (2014) voom: Precision weights unlock linear model analysis tools for RNA-seq read counts. Genome Biol, 15, R29.
+- Lê,S. et al. (2008) FactoMineR: An R Package for Multivariate Analysis. J. Stat. Software; Vol 1, Issue 1.
+- Leek,J.T. (2014) svaseq: removing batch effects and other unwanted noise from sequencing data. Nucleic Acids Res, 42.
+- Risso,D. et al. (2014) Normalization of RNA-seq data using factor analysis of control genes or samples. Nat. Biotechnol., 32, 896–902.
+- Ritchie,M.E. et al. (2015) limma powers differential expression analyses for RNA-sequencing and microarray studies. Nucleic Acids Res, 43, e47.
+- Robinson,M.D. et al. (2010) edgeR: a Bioconductor package for differential expression analysis of digital gene expression data. Bioinformatics, 26, 139–140.
+- Soneson,C. et al. (2015) Differential analyses for RNA-seq: transcript-level estimates improve gene-level inferences. F1000Res, 4, 1521.
+
+
+# Defined functions
+
+```{r}
+##################################################################################
+#' Summing Over Replicate Arrays
+#' 
+#' @param x a matrix-like object.
+#' @param group grouping of sample identifier.
+#' @return A data object of the same class as x with a column for sums according grouping.
+#' @examples 
+#' set.seed(100)
+#' x<- matrix(rnorm(8*4),8,4)
+#' colnames(x) <- c("a","a","b","b")
+#' sumarrays(x)
+#' data.frame(a=x[,1]+x[,2],b=x[,3]+x[,4])
+
+sumarrays<-function(x,group=NULL){
+  if(is.null(group))
+    group<-colnames(x)
+  colnames(x)<-group
+  
+  x<-rowsum(t(x),group = group)
+  #order the columns as the input group odering
+  x<-data.frame(t(x)[,unique(group)])
+  return(x)
+}
+
+##################################################################################
+###filter cpm
+edgeR_filter<-function(mat,cutoff=40,...){
+  rowSums(edgeR::cpm(mat,...)>1)>=cutoff
+}
+
+##################################################################################
+###refine design matrix column names
+idx_refine<-function(idx){
+  idx<-gsub('blockblock','block',idx)
+  idx<-gsub('nstime','T',idx)
+  idx<-gsub('btime','',idx)
+  idx<-gsub(':','.',idx)
+  idx
+}
+
+##################################################################################
+###estimate batch effect
+remove_batch<-function(dat0,design,group){
+  start.time <- Sys.time()
+  dat0<-round(as.matrix(dat0),0)
+  message('Estimate norm factor...')
+  y <- DGEList(counts=dat0, group=group)
+  y <- calcNormFactors(y)
+  message('Estimate Common Dispersion for Negative Binomial GLMs ...')
+  y <- estimateGLMCommonDisp(y, design)
+  y <- estimateGLMTagwiseDisp(y, design)
+  message('Fit genewise Negative Binomial Generalized Linear Models and calculate residuals...')
+  fit <- glmFit(y, design)
+  res <- residuals(fit, type="deviance")
+  # seqUQ <- betweenLaneNormalization(dat0, which="upper")
+  controls = rep(TRUE,dim(dat0)[1])
+  message('Remove Unwanted Variation Using Residuals...')
+  # batch_ruv_res = RUVr(seqUQ,controls,k=1,res) 
+  batch_ruv_res = RUVr(dat0,controls,k=1,res)
+  end.time <- Sys.time()
+  time.taken <- end.time - start.time
+  message(paste('Time for analysis:',round(time.taken,3),attributes(time.taken)$units))
+  message('Done!!!')
+  return(c(batch_ruv_res,res=list(res)))
+}
+
+##################################################################################
+###PCA plot
+plot_PCA<-function(data2pca,groups,pc1=1,pc2=2,title='PCA plot',plotly=F,
+                   color.values,shape=rep(c(0:25),10),...){
+  if(nrow(data2pca)==length(groups)){
+    data2pca<-data.frame(data2pca)
+  } else if(ncol(data2pca)==length(groups)){
+    data2pca<-data.frame(t(data2pca))
+  } else {
+    return(message('Please provide proper input data for PCA'))
+  }
+  
+  groups <- factor(groups,levels = unique(groups))
+  # data2pca$groups<-groups
+  fit<-PCA(data2pca,ncp = 15,graph = F)
+  # fit <- prcomp(data2pca,  scale = TRUE)
+
+
+  p=fviz_pca_ind(fit,habillage = groups, ellipse.level = 0.75,
+                 axes = c(pc1,pc2),col.ind = 'cos2',...) +
+    labs(title=title)+
+    theme_minimal()+scale_shape_manual(values = shape)+scale_color_manual(values=color.values)
+  if(plotly)
+    p<-ggplotly(p)
+  return(p)
+  
+}
+
+##################################################################################
+###DE and DAS analysis
+#' Use Limma to implement DE analysis
+#'
+#' A wrapped function of Limma package to DE analysis.
+#'
+#' @param dge a edgeR object or read counts matrix
+#' @param targets gene/transcript names
+#' @param design a design matrix
+#' @param contrast a contrast model for \code{contrast.fit} function
+#' @param eBayes.model to implement \code{eBayes()} or not
+#' @param splice.model to implement \code{diffsplice()} or not
+#' @param testing to output p-values or not
+#' @param adjust.method p-values ajusted methods in \code{topTable()}
+#' @return a list of results, including fitted models and testing p-values
+
+
+AtRTD2DE<-function(dge,
+                   fit_lmFit=NULL,
+                   targets=NULL,
+                   design,
+                   contrast,
+                   contrast.model=T,
+                   eBayes.model=T,
+                   splice.model=F,
+                   testing=T,
+                   voom=T,
+                   adjust.method ="holm",
+                   FDR=0.05,pval=0.01,...){
+  start.time <- Sys.time()
+  if(is.null(targets))
+    targets<-rownames(dge$counts)
+  
+  
+  DE_results<-list()
+  if(voom){
+    message('Limma voom to transform data ...')
+    read_count_voom<-voom(dge,design,plot=F,span = 0.3)
+    DE_results$read_count_voom<-read_count_voom
+    message('Fit a basic linear model ...')
+    fit_lmFit <- lmFit(read_count_voom, design)
+  }
+  if(!voom & is.null(fit_lmFit))
+    return(message('Data for model fit is not provided.'))
+  DE_results$fit_lmFit<-fit_lmFit
+  if(contrast.model){
+    contrast.matrix <- makeContrasts(contrasts = contrast, levels=design)
+    message('Fit the contrast model ...')
+    print(contrast)
+    fit_contrast<-contrasts.fit(fit_lmFit, contrast.matrix)
+    DE_results$fit_contrast<-fit_contrast
+  } else {
+    fit_contrast<-fit_lmFit
+  }
+  if(splice.model){
+    message('Fit a splicing model ...')
+    fit_splice<-diffSplice(fit_contrast, ...)
+    DE_results$fit_splice<-fit_splice
+  }
+  if(eBayes.model){
+    message('Fit a eBayes model ...')
+    fit_eBayes<-eBayes(fit_contrast)
+    DE_results$fit_eBayes<-fit_eBayes
+  }
+  
+  ##p-value
+  if(testing){
+    message('Calcualte p-values from individual testing ...')
+    results_pval_list<-list()
+    for(i in 1:length(contrast)){
+      contrast.idx<-contrast[i]
+      sub.de.reaults<-topTable(fit_eBayes, coef=contrast.idx, 
+                               adjust.method =adjust.method,number = Inf)
+      sub.de.reaults<-sub.de.reaults[targets,]
+      results_pval_list<-c(results_pval_list,setNames(list(sub.de.reaults),contrast.idx))
+    }
+    # 
+    results_pval_ind<-do.call(cbind,lapply(results_pval_list,FUN = function(x) x$adj.P.Val))
+    rownames(results_pval_ind)<-targets
+    
+    message('Calcualte p-values from overall testing ...')
+    results_pval_overall<-topTable(fit_eBayes,number = Inf,
+                                   coef = contrast,adjust.method =adjust.method )
+    results_pval_overall<-results_pval_overall[targets,]
+    idx1<-ncol(results_pval_overall)-4
+    idx2<-length(contrast)
+    idx3<-idx1-idx2+1
+    colnames(results_pval_overall)[idx3:idx1]<-contrast
+    
+    
+    DE_results$results_pval_list<-results_pval_list
+    DE_results$results_pval_ind<-results_pval_ind
+    DE_results$results_pval_overall<-results_pval_overall
+    
+    ###summary DAS
+    if(splice.model){
+      
+      order.idx<-unique(as.vector(t(fit_splice$genes$GeneID)))
+      length(order.idx)
+      order.trans.idx <- rownames(fit_splice$p.value)
+      
+      DAS.list.t<-lapply(contrast,function(x){
+        y<-topSplice(fit_splice, coef=x, test="t", number=Inf, FDR=10000)
+        rownames(y)<-y$TransID
+        z <- y[order.trans.idx,]
+      })
+      
+    ###DAS trans level p-values  
+      names(DAS.list.t) <- contrast
+      trans.idx <- rownames(DAS.list.t[[1]])
+      y <- lapply(names(DAS.list.t),function(i){
+        x <- DE_results_trans$DAS.list.t[[i]]
+        y <- data.frame(pval=x$FDR)
+        rownames(y) <- rownames(x)
+        y <- y[trans.idx,]
+        y
+      })
+      pval_DAS_ind <- do.call(cbind,y)
+      rownames(pval_DAS_ind) <- trans.idx
+      colnames(pval_DAS_ind) <- contrast
+      DE_results$pval_DAS_ind <- pval_DAS_ind
+      
+      DAS.list.F<-lapply(contrast,function(x){
+        y<-topSplice(fit_splice, coef=x, test="F", number=Inf, FDR=10000)
+        rownames(y)<-y$GeneID
+        y[order.idx,]
+      })
+      
+      DAS.list.simes<-lapply(contrast,function(x){
+        y <- topSplice(fit_splice, coef=x, test="simes", number=Inf, FDR=10000)
+        rownames(y)<-y$GeneID
+        y[order.idx,]
+      })
+      
+      names(DAS.list.F)<-names(DAS.list.simes) <- names(DAS.list.t)<-contrast
+      
+      ##Summary the DAS using t test
+      # x<-lapply(contrast,function(x){
+      #   y<-DAS.list.t[[x]]
+      #   idx<-y$P.Value<=pval & y$FDR<=FDR
+      #   y<-data.frame(idx=idx,row.names = rownames(y))
+      #   colnames(y)<-x
+      #   y
+      # })
+      DAS.indicator.t<-pval_DAS_ind<=FDR
+      
+      ##Summary the DAS using F test
+      x<-lapply(contrast,function(x){
+        y<-DAS.list.F[[x]]
+        idx<-y$P.Value<=pval & y$FDR<=FDR
+        y<-data.frame(idx=idx,row.names = rownames(y))
+        colnames(y)<-x
+        y
+      })
+      
+      DAS.indicator.F<-do.call(cbind,x)
+      
+      ##Summary the DAS using Simes test
+      x<-lapply(contrast,function(x){
+        y<-DAS.list.simes[[x]]
+        idx<-y$P.Value<=pval & y$FDR<=FDR
+        y<-data.frame(idx=idx,row.names = rownames(y))
+        colnames(y)<-x
+        y
+      })
+      
+      DAS.indicator.simes<-do.call(cbind,x)
+      
+      
+      ##put results to list
+      DE_results$DAS.list.t<-DAS.list.t
+      DE_results$DAS.list.simes<-DAS.list.simes
+      DE_results$DAS.list.F<-DAS.list.F
+      DE_results$DAS.indicator.t<-DAS.indicator.t
+      DE_results$DAS.indicator.F<-DAS.indicator.F
+      DE_results$DAS.indicator.simes<-DAS.indicator.simes
+      
+    }
+    
+    
+    
+  }
+  end.time <- Sys.time()
+  time.taken <- end.time - start.time
+  message(paste0('Time for analysis: ',round(time.taken,3)))
+  message('Done!!! ')
+  return(DE_results)
+}
+
+##################################################################################
+#' Count the number of a value in a vector
+#' @param x a numeric vector.
+#' @param value value to count.
+#' @param consecutive logical whether to count the value consecutively.
+#' @param counts cut-off of the count number of the value
+#' @return TRUE or FALSE to indicate if the counts of the value is greater or equal to the counts cut-off.
+value.counts<-function(x,value,consecutive=T,counts=2){
+  x<-as.vector(x)
+  if(consecutive){
+    idx<-rle(x)
+    value.idx<-which(idx$values==value)
+    length.idx<-idx$lengths[value.idx]
+    y<-any(length.idx>=counts)
+  } else {
+    idx<-table(x)
+    y<-idx[names(idx)==value]>=counts
+    if(length(y)==0)
+      y=F
+  }
+  return(as.vector(y))
+}
+
+##################################################################################
+##GO of member in clusters
+cluster2GO<-function(clusters,label,...){
+  idx<-unique(sort(clusters$clusters))
+  
+  FunAnn_clusters<-lapply(idx,function(i){
+    message(paste0('Processing Cluster ',i))
+    genes2ann<-as.vector(clusters$genes[clusters$clusters==i])
+    # length(genes2ann)
+    FunAnn<-gene2GO(genes2ann = genes2ann)
+    g<-Go2plot(FunAnn = FunAnn,gene.group = paste0('Cluster',i),
+               BP.n = 6,MF.n = 6,CC.n = 6,str.length.cut = 50,...)
+    save.figure(g,file=paste0('figure/',label,'-Go of Cluster ',i),
+                width = 5,height = 4,units = 'in',res = 600)
+    return(FunAnn)
+  })
+  names(FunAnn_clusters)<-paste0('Cluster',idx)
+  return(FunAnn_clusters)
+}
+
+##################################################################################
+##GO analysis
+#' GO analysis using DAVID
+#' @param email user's email for DAVID acount.
+#' @param url https://david.ncifcrf.gov/webservice/services/DAVIDWebService.DAVIDWebServiceHttpSoap12Endpoint/
+#' @param gene2anno genes used to do GO analysis
+#' @param idType haracter with the type of submitted ids. Default is "TAIR_ID".
+#' @param categories character vector with the category name/s to use in the analysis
+#' @param timeOut Set apache Axis time out in milliSeconds.
+gene2GO<-function(
+  email="wenbin.guo@hutton.ac.uk",
+  url="https://david.ncifcrf.gov/webservice/services/DAVIDWebService.DAVIDWebServiceHttpSoap12Endpoint/",
+  genes2ann,
+  idType="TAIR_ID",
+  categories=c("GOTERM_BP_DIRECT", "GOTERM_MF_DIRECT", "GOTERM_CC_DIRECT"),
+  timeOut=100000
+){
+  start.time <- Sys.time()
+  
+  david<-DAVIDWebService$new(email=email, url=url)
+  setTimeOut(david, timeOut)
+  result<-addList(david, genes2ann,
+                  idType=idType,
+                  listName='Genes', listType="Gene")
+  setAnnotationCategories(david,categories = categories)
+  genes_FunAnn<-getFunctionalAnnotationChart(david)
+  
+  end.time <- Sys.time()
+  time.taken <- end.time - start.time
+  message(paste0("Time for analysis: ", round(time.taken, 3), 
+                 " ", attributes(time.taken)$units))
+  message("Done!!! ")
+  return(genes_FunAnn)
+}
+
+##################################################################################
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+##################################################################################
+Go2plot<-function(FunAnn,category.idx=c('BP','MF','CC'),
+                  column='FDR',FDR.cut=0.05,remove.low.FDR=T,gene.group='DE',
+                  text.size=2,str.length.cut=50,facet.scales = "free_y",
+                  BP.n=6,MF.n=6,CC.n=6,x.by=10){
+  
+  ##make data to plot
+  
+  data2plot<-lapply(category.idx,function(x){
+    idx<-which(grepl(pattern = paste0('_',x,'_'),FunAnn$Category))
+    if(length(idx)==0 | get(paste0(x,'.n'))==0){
+      data.frame(Group=NA,Category=NA,Term=NA,FDR=NA,row.names = NULL)
+    } else {
+      y<-FunAnn[idx,]
+      y<-y[order(y[,column],decreasing =F),][1:min(nrow(y),get(paste0(x,'.n'))),]
+      y<-y[order(y[,column],decreasing =T),]
+      if(remove.low.FDR)
+        y <- y[y[,column]<=FDR.cut,]
+      
+      if(nrow(y)==0){
+        data.frame(Group=NA,Category=NA,Term=NA,FDR=NA,row.names = NULL)
+      } else {
+        ##remove GO ID
+        idx<-sapply(y$Term,function(x){
+          x<-as.vector(x)
+          if(grepl(pattern = '~',x = x))
+            x<-unlist(strsplit(x,'~'))[2]
+          x
+        })
+        
+        ##short the length of annotation string
+        idx<-sapply(idx,function(x){
+          if(nchar(x)>str.length.cut)
+            x<-paste0(substr(x,1,str.length.cut),'...')
+          x
+        })
+        
+        data.frame(Group=gene.group,Category=x,Term=idx,FDR=-log10(y$FDR),row.names = NULL)
+      }
+    }
+  })
+  
+  ##make the plot
+  data2plot<-do.call(rbind,data2plot)
+  data2plot <- na.omit(data2plot)
+  
+  if(dim(data2plot)[1]==0)
+    return(NULL)
+  
+  
+  data2plot$Term<-tofactor(data2plot$Term)
+  
+  y1<--log10(FDR.cut)
+  ymin<-min(data2plot$FDR)
+  ymax<-max(data2plot$FDR)
+  y <- ((ymax-y1)-(y1-ymin))*0.05
+  
+  data2plot$Category <- factor(data2plot$Category,levels = c('BP','MF','CC'))
+  fill.colors0 <- gg_color_hue(3)
+  names(fill.colors0) <- c('BP','MF','CC')
+  fill.colors <- fill.colors0[data2plot$Category] 
+    
+  # png('figure/GO annotation DE.png',width = 10,height = 1.5,res = 600,units = 'in')
+  g<-ggplot(data2plot,aes(x=Term,y=FDR))+geom_bar(aes(fill = Category),stat='identity', 
+                                                  position = position_stack(reverse = TRUE)) +
+    coord_flip() +theme_bw()+
+    theme(axis.title.y = element_blank(),strip.background = element_rect(fill="lightblue"),
+          legend.position = 'none',
+          strip.text = element_text(size = 8), 
+          panel.grid.major.y = element_blank(),panel.grid.minor.y  = element_blank(),
+          axis.text.y=element_text(size = 12),
+          panel.spacing = unit(0.1, "lines"))+
+    labs(y=paste0('-log10(',column,')'),title=gene.group)+
+    # facet_wrap(~Category,scales = facet.scales,space=facet.scales, ncol = 1,strip.position='right')+
+    facet_grid(Category~.,scales = 'free_y',space='free_y')+
+    scale_fill_manual(values = fill.colors)
+    # geom_hline(yintercept=(-log10(FDR.cut)),lty=2)+
+    # annotate(geom="text", x=1,y=y1+y, label=paste0(column,'=',FDR.cut),color="black",size=text.size)
+    # scale_y_continuous(breaks = seq(0,max(data2plot$FDR)*1.1,
+    #                                 by = ifelse(floor(max(data2plot$FDR)/x.by)>1,floor(max(data2plot$FDR)/x.by),round(max(data2plot$FDR)/x.by,1))))
+  g
+  
+  
+}
+
+##################################################################################
+##plot heatmap
+plot.heatmap<-function(data2plot,
+                       ha,leg,
+                       label,folder='figure',
+                       # cluster1,
+                       col=colorRamp2(c(-3, 0, 4), c("blue", "white", "red")),
+                       split,
+                       dis.method='pearson',
+                       cluster.method='ward.D'
+){
+  if(!file.exists(folder))
+    dir.create(folder,recursive = T)
+  heatmap2plot<-ComplexHeatmap::Heatmap(
+    data2plot, name = "Z-score",  
+    # km = 8,
+    col = col,
+    show_row_names = FALSE, show_column_names = T,cluster_columns = FALSE,
+    split=split,
+    clustering_distance_rows = function(x) factoextra::get_dist(x,method = dis.method),
+    clustering_method_rows = cluster.method,
+    top_annotation = ha,
+    heatmap_legend_param = list(color_bar = "continuous"),
+    column_title=label, 
+    column_title_gp = gpar(fontsize = 18, fontface = "bold")
+    # row_title = 'DAs genes',row_title_side = "right"
+  )
+  
+  save.figure(p=heatmap2plot+leg,Fun=draw,file=paste0(folder,'/',label),
+              width = 6,height =10,res = 600,units = 'in',type = 'both')
+  return(list(heatmap2plot=heatmap2plot,cluster1=cluster1))
+}
+##################################################################################
+#' Make color darker
+#' @param cols the colors
+
+color.darken<-function(cols,threshold=0.9){
+  library(colorspace)
+  cols.old<-cols
+  cols <-hex2RGB(gplots::col2hex(cols))
+  lab <- as(cols,"LAB")
+  lab@coords[,1] <- lab@coords[,1] *threshold # 
+  cols.new <-  hex(as(lab,"RGB"))
+  if(any(is.na(cols.new)))
+    cols.new[is.na(cols.new)]<-cols.old[is.na(cols.new)]
+  cols.new
+}
+
+cor.mtest <- function(mat, ...) {
+  mat <- as.matrix(mat)
+  n <- ncol(mat)
+  p.mat<- matrix(NA, n, n)
+  diag(p.mat) <- 0
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      tmp <- cor.test(mat[, i], mat[, j], ...)
+      p.mat[i, j] <- p.mat[j, i] <- tmp$p.value
+    }
+  }
+  colnames(p.mat) <- rownames(p.mat) <- colnames(mat)
+  p.mat
+}
+
+##################################################################################
+##################################################################################
+##WGCNA analysis
+wgcna.analysis<-function(
+  object=NULL,
+  data2wgcna,
+  powers=NULL,
+  minModuleSize = 50,
+  zscore=T,
+  pca.scale=T,
+  traits=NULL,
+  hclust.method='average',
+  merge.hclust.method='average',
+  tom.plot=T,
+  scaled=T,
+  merge.cluster=T,
+  merge.threshold = 0.2,
+  label,
+  pamStage=T,
+  corOptions = "use = 'p'",
+  cor.analysis=F,
+  figure.folder='figure',
+  save.input=T,
+  onlysft=F,
+  remove.self=F,
+  RsquaredCut=0.85,
+  ...
+){
+  ###example####
+  wgcna.results<-list()
+  ##create plot save folder
+  if(!file.exists(figure.folder))
+    dir.create(figure.folder,recursive = T)
+  
+  if(zscore)
+    data2wgcna<-apply(data2wgcna,2,scale)
+  
+  
+  ##########################################################################################################
+  if(is.null(object)){
+    message('Selecting best soft-threshold ... ')
+    ###set powers
+    if(is.null(powers))
+      powers = c(c(1:10), seq(from = 11, to=50, by=3))
+    sft = pickSoftThreshold(data2wgcna, powerVector = powers, verbose = 5,networkType = 'signed',RsquaredCut=RsquaredCut)
+    
+    powers.more<-seq(max(powers)+3,max(powers)+50,by=3)
+    while(is.na(sft$powerEstimate)){
+      sft <- pickSoftThreshold(data2wgcna, powerVector = powers.more, verbose = 5,networkType = 'signed')
+      powers.more<-seq(max(powers.more)+3,max(powers.more)+50,by=3)
+    }
+    
+    # if(is.na(sft$powerEstimate))
+    #   stop('Soft-threshold is not estimated. It seems WGCNA method is not proper for the input data')
+    
+    
+    
+    ##soft threshold plot
+    cex1<-sft$powerEstimate
+    
+    figure.folder
+    png(paste0(figure.folder,'/',label,'-soft_threshold.png'),width = 10,height = 5,res = 600,units = 'in')
+    
+    # ###make a plot
+    par(mfrow = c(1,2));
+    # Scale-free topology fit index as a function of the soft-thresholding power
+    plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+         xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+         main = paste("Scale independence"));
+    text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+         labels= sft$fitIndices$Power,cex=0.7,col="red");
+    # this line corresponds to using an R^2 cut-off of h
+    # abline(h=sft$fitIndices$SFT.R.sq[sft$fitIndices$Power==sft$powerEstimate],col="red")
+    h <- sft$fitIndices[sft$fitIndices$Power==sft$powerEstimate,2]
+    abline(h=h,col="red")
+    mtext(text = round(h,2),at=h, side=2,col="red",cex=0.7)
+    # Mean connectivity as a function of the soft-thresholding power
+    plot(sft$fitIndices[,1], sft$fitIndices[,5],
+         xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+         main = paste("Mean connectivity"))
+    text(sft$fitIndices[,1], sft$fitIndices[,5], labels= sft$fitIndices$Power, cex=0.7,col="red")
+    h <- sft$fitIndices[sft$fitIndices$Power==sft$powerEstimate,5]
+    abline(h=h,col="red")
+    mtext(text = round(h,2),at=h, side=2,col="red",cex=0.7)
+    dev.off()
+    
+    ##########################################################################################################
+    
+    #Calculate the TOM
+    message('Calculating TOM ... ')
+    softPower<-sft$powerEstimate
+    
+    ##adjacency matrix
+    adjacency = adjacency(data2wgcna, power = softPower,type='signed',corOptions=corOptions)
+    if(remove.self)
+      diag(adjacency) <- 0
+    wgcna.results$adjacency<-adjacency
+    # Turn adjacency into topological overlap
+    TOM = TOMsimilarity(adjacency,TOMType = 'signed');
+  } else{
+    # data2wgcna <- object$data2wgcna
+    sft <- object$sft
+    TOM <- object$TOM
+    # minModuleSize <- object$minModuleSize
+  }
+  
+  
+  ##save to results
+  if(save.input)
+    wgcna.results$data2wgcna <- data2wgcna
+  
+  
+  wgcna.results$TOM<-TOM
+  wgcna.results$sft<-sft
+  wgcna.results$minModuleSize<-minModuleSize
+  
+  if(onlysft)
+    return(wgcna.results)
+  
+  # save(dissTOM,file=paste0('data/dissTOM for ',dim(data2wgcna)[2],' genes.RData'))
+  
+  # Call the hierarchical clustering function
+  dissTOM = 1-TOM
+  geneTree = hclust(as.dist(dissTOM), method = hclust.method);
+  # # Plot the resulting clustering tree (dendrogram)
+  # sizeGrWindow(12,9)
+  # plot(geneTree, xlab="", sub="", main = "Gene clustering on TOM-based dissimilarity",
+  #      labels = FALSE, hang = 0.05)
+  
+  ##########################################################################################################
+  
+  #####Clustering results
+  message('Clustering ...')
+  wgcna.results$minModuleSize<-minModuleSize
+  ###dynamic cluster
+  # Module identification using dynamic tree cut:
+  dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM,pamStage=pamStage,
+                              deepSplit = 1, pamRespectsDendro = T,
+                              minClusterSize = minModuleSize);
+  # table(dynamicMods)
+  ##save to results
+  wgcna.results$dynamicMods<-dynamicMods
+  
+  # Convert numeric lables into colors
+  dynamicColors = labels2colors(dynamicMods)
+  table(dynamicColors)
+  
+  ##save to results list
+  wgcna.results$dynamicColors<-dynamicColors
+  
+  
+  # sizeGrWindow(8,6)
+  if(!merge.cluster){
+    png(paste0(figure.folder,'/',label,'-modules.png'),width=9,height=6,res=600,units = 'in')
+    plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",
+                        dendroLabels = FALSE, hang = 0.03,
+                        addGuide = TRUE, guideHang = 0.05,
+                        main = "Gene dendrogram and module colors")
+    dev.off()
+  }
+  
+  ##########################################################################################################
+  
+  ##eigen before merge
+  MEList.beforemerge = moduleEigengenes(data2wgcna, colors = dynamicColors)
+  wgcna.results$MEList.beforemerge<-MEList.beforemerge
+  
+  MEs = MEList.beforemerge$eigengenes
+  MEDiss = 1-cor(MEs);
+  # Cluster module eigengenes
+  METree.beforemerge = hclust(as.dist(MEDiss), method = hclust.method);
+  # Plot the result
+  
+  wgcna.results$METree.beforemerge<-METree.beforemerge
+  
+  png(paste0(figure.folder,'/',label,'-eigengenes before merge.png'),width=9,height=6,res=600,units = 'in')
+  plot(METree.beforemerge, main = "Clustering of module eigengenes",
+       xlab = "", sub = "")
+  # Plot the cut line into the dendrogram
+  abline(h=merge.threshold, col = "red")
+  dev.off()
+  
+  
+  cluster.idx<-data.frame(target=colnames(data2wgcna),
+                          color.beforemerge=dynamicColors,
+                          cluster.beforemerge=dynamicMods
+  )
+  
+  
+  ##########################################################################################################
+  if(merge.cluster){
+    ##merge the cluster
+    message('Merging clusters ...')
+    ###calcluate the eigengenes
+    # Calculate eigengenes
+    
+    ##do the merge
+    merge = mergeCloseModules(data2wgcna, dynamicColors, cutHeight = merge.threshold, verbose = 3)
+    ##save to results list
+    wgcna.results$merge<-merge
+    
+    # The merged module colors
+    mergedColors = merge$colors;
+    # Eigengenes of the new merged modules:
+    mergedMEs = merge$newMEs;
+    
+    cat(paste0(' Module number before merge: ',length(table(dynamicColors))))
+    cat(paste0(' Module number after merge: ',length(table(mergedColors))))
+    
+    
+    
+    
+    
+    
+    
+    ##make new plots
+    png(paste0(figure.folder,'/',label,'-hist plot after merge.png'),width=9,height=6,res=600,units = 'in')
+    plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors),
+                        c("Dynamic Tree Cut", "Merged dynamic"),
+                        dendroLabels = FALSE, hang = 0.03,
+                        addGuide = TRUE, guideHang = 0.05)
+    dev.off()
+    
+    ##########################################################################################################
+    
+    #make the eigen plot after merge
+    message('Analysing the eignes of the modules ...')
+    MEList.aftermerge = moduleEigengenes(data2wgcna, colors = mergedColors)
+    wgcna.results$MEList.aftermerge<-MEList.aftermerge
+    ###make the plot
+    
+    cluster.idx$color.aftermerge <- mergedColors
+    cluster.idx$cluster.aftermerge<-cluster.idx$cluster.beforemerge[match(cluster.idx$color.aftermerge,cluster.idx$color.beforemerge)]
+    if(any(cluster.idx$cluster.aftermerge==0))
+      cluster.idx$new.cluster<-dplyr::dense_rank(cluster.idx$cluster.aftermerge)-1 else cluster.idx$new.cluster<-dplyr::dense_rank(cluster.idx$cluster.aftermerge)
+    
+    ##eigengenes
+    MEs<-MEList.aftermerge$eigengenes
+    ###cluster of eigen after merge
+    MEDiss = 1-cor(MEs);
+    # Cluster module eigengenes
+    METree.aftermerge = hclust(as.dist(MEDiss), method = merge.hclust.method);
+    # Plot the result
+    wgcna.results$METree.aftermerge<-METree.aftermerge
+    ###clusters for the first layer of clusters
+    
+    cluster.cluster.idx<- cutree(METree.aftermerge,h=0.85)
+    if(any(names(cluster.cluster.idx)=='MEgrey')){
+      cluster.cluster.idx[cluster.cluster.idx>cluster.cluster.idx["MEgrey"]] <- cluster.cluster.idx[cluster.cluster.idx>cluster.cluster.idx["MEgrey"]]-1
+      cluster.cluster.idx['MEgrey'] <- 0
+    }
+    new.cluster.cluster<-cluster.cluster.idx[paste0('ME',cluster.idx$color.aftermerge)]
+    
+    idx<-new.cluster.cluster
+    idx<-cluster.idx$cluster.aftermerge+1000*idx
+    if(any(cluster.idx$cluster.aftermerge==0)) new.cluster.cluster<-dplyr::dense_rank(idx)-1 else new.cluster.cluster<-dplyr::dense_rank(idx)
+    cluster.idx$new.cluster.cluster<-new.cluster.cluster
+    
+    
+    varExplained<-paste0(round(MEList.aftermerge$varExplained,4)*100,'%')
+    names(varExplained)<-colnames(MEs)
+    
+    ###
+    module.idx<-cluster.idx[,c('color.aftermerge','new.cluster.cluster')]
+    module.idx<-module.idx[!duplicated(module.idx),,drop=T]
+    module.idx<-module.idx[order(module.idx[,2],decreasing = F),]
+    rownames(module.idx)<- paste0('ME',module.idx[,1])
+    
+    ##make plot
+    col.idx=5
+    idx<-nrow(module.idx)
+    idx<-ceiling(idx/col.idx)
+    png(paste0(figure.folder,'/',label,'-PC1 of merged modules.png'),
+        width = 14,height = idx*3,res = 600,units = 'in')
+    layout(matrix(1:(col.idx*idx),ncol=col.idx,nrow=idx,byrow = T))
+    sapply(1:nrow(module.idx),function(x){
+      module<-module.idx$new.cluster.cluster[x]
+      module.genes<-as.vector(cluster.idx$target[cluster.idx$new.cluster.cluster==module])
+      module.data<-data2wgcna[,module.genes]
+      module.color<-as.vector(module.idx$color.aftermerge[x])
+      ##make the plot
+      matplot(module.data,type='l',col=module.color,lty = 1,
+              main=paste0('Module ',module,', Gene=',length(module.genes),' (Var.pc1=',varExplained[paste0('ME',module.color)],')'),
+              ylab=if(scaled) 'Z-score' else 'Expression')
+      if(module.color=='black')
+        matlines(MEs[,paste0('ME',module.color)],col='white',lwd = 2) else matlines(MEs[,paste0('ME',module.color)],col='black',lwd = 2)
+    })
+    dev.off()
+    
+    if(cor.analysis){
+      ##correlation of eigenes
+      
+      MEs<-MEs[,rownames(module.idx)]
+      colnames(MEs)<-module.idx$new.cluster.cluster
+      
+      module.cor<-Hmisc::rcorr(as.matrix(MEs))
+      p.mat<-module.cor$P
+      png(paste0(figure.folder,'/',label,'-module correlation matrix.png'),
+          width = 5,height = 5,res = 600,units = 'in')
+      corrplot::corrplot(module.cor$r, type="upper", order="hclust", 
+                         p.mat = p.mat, sig.level = 0.01, insig = "blank",
+                         hclust.method = 'ward.D',title='Correlation of PC1, p<0.01',
+                         mar=c(0,0,0.8,0),cl.ratio=0.2)
+      dev.off()
+      
+      
+      
+      module.cor$r[module.cor$P>0.01]<-0
+      diag(module.cor$r)<-0
+      
+      png(paste0(figure.folder,'/',label,'-module correlation network.png'),
+          width = 5,height = 5,res = 600,units = 'in')
+      qgraph::qgraph(module.cor$r,edge.labels = TRUE,layout = "spring",esize=8,vsize=4)
+      title("Co-expression network of Modules, p<0.01",line=3,cex.main=1)
+      dev.off()
+      wgcna.results$module.cor<-module.cor
+    }
+    
+  }
+  
+  wgcna.results$cluster.idx<-cluster.idx
+  ##########################################################################################################
+  
+  if(!is.null(traits)){
+    
+    wgcna.results$traits<-traits
+    message('Analysing module association to traits ...')
+    ##Association to traits
+    sampleTree2 = hclust(dist(data2wgcna), method = hclust.method)
+    # Convert traits to a color representation: white means low, red means high, grey means missing entry
+    traitColors = numbers2colors(traits, signed = FALSE);
+    # Plot the sample dendrogram and the colors underneath.
+    png(paste0(figure.folder,'/',label,'-Sample dendrogram and trait heatmap.png'),
+        width=9,height=6,res=600,units = 'in')
+    plotDendroAndColors(sampleTree2, traitColors,groupLabels = names(traits),
+                        main = "Sample dendrogram and trait heatmap")
+    dev.off()
+    
+    
+    # Define numbers of genes and samples
+    nGenes = ncol(data2wgcna);
+    nSamples = nrow(data2wgcna);
+    # Recalculate MEs with color labels
+    MEs0 = moduleEigengenes(data2wgcna, cluster.idx$color.aftermerge)$eigengenes
+    colnames(MEs0)<-module.idx[colnames(MEs0),2]
+    
+    # x<-cutree(hclust(factoextra::get_dist(MEs0,method = "spearman"),method = 'average'),k=4)
+    MEs = orderMEs(MEs0)
+    moduleTraitCor = cor(MEs, traits, use = "p",method = 'spearman');
+    moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples);
+    
+    # Will display correlations and their p-values
+    textMatrix = paste(signif(moduleTraitCor, 2), "\n(",
+                       signif(moduleTraitPvalue, 1), ")", sep = "");
+    dim(textMatrix) = dim(moduleTraitCor)
+    
+    
+    
+    png(paste0(figure.folder,'/',label,'-Module-trait relationships.png'),
+        width=8,height=9,res=600,units = 'in')
+    par(mar = c(6, 8.5, 3, 3));
+    # Display the correlation values within a heatmap plot
+    labeledHeatmap(Matrix = moduleTraitCor,
+                   xLabels = colnames(moduleTraitCor),
+                   yLabels = rownames(moduleTraitCor),
+                   ySymbols = names(MEs),
+                   colorLabels = FALSE,
+                   colors = greenWhiteRed(50,warn = F),
+                   textMatrix = textMatrix,
+                   setStdMargins = FALSE,
+                   cex.text = 0.75,
+                   zlim = c(-1,1),
+                   main = paste("Module-trait relationships\n Spearman correlation, p-value"))
+    dev.off()
+    
+  }
+  
+  if(tom.plot){
+    message('Making TOM plot ...')
+    nGenes = ncol(data2wgcna)
+    nSamples = nrow(data2wgcna)
+    
+    
+    plotTOM = dissTOM^10
+    diag(plotTOM) = NA
+    png(paste0(figure.folder,'/',label,'-TOMplot.png'),width =8,height = 8,units = 'in',res = 600)
+    TOMplot(plotTOM, geneTree, mergedColors, main = "Network heatmap plot")
+    dev.off()
+  }
+  return(wgcna.results)
+  
+}
+
+#############################################################################
+#############################################################################
+
+
+
+#############################################################################
+g_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
+
+#############################################################################
+darken.col <- function(cols,depth=0.8){
+  # library(grDevices)
+  col0 <- grDevices::col2rgb(cols)
+  col1 <- sapply(1:ncol(col0),function(x){
+    grDevices::rgb(depth*col0[,x][1],depth*col0[,x][2],depth*col0[,x][3],maxColorValue=255)
+  })
+  col1
+}
+
+#############################################################################
+#' Eigen analysis of clusters
+#' 
+#' @param data2ana data to analysis.
+#' @param clusters the clusters of the data. A vector to tell the cluster of the individuals.
+#' @param label the label is attached to the file name to save the figure.
+#' @param eigen.layout the layout to make the eigen plots.
+#' @param colorOrder a vector of colours to plot the eigens.
+#' @param sig.level the p-value cut-off to do the correlation analysis of the modules.
+eigen.analysis<-function(data2ana,
+                         clusters,
+                         label='DAS',
+                         eigen.layout=matrix(1:8,ncol=4,nrow=2,byrow = T),
+                         colorOrder,
+                         sig.level=0.01,
+                         cor.method='pearson'){
+  eigen = moduleEigengenes(data2ana, colors = clusters)
+  # eigen$varExplained
+  MEs<-eigen$eigengenes
+  varExplained<-paste0(round(eigen$varExplained,4)*100,'%')
+  names(varExplained)<-colnames(MEs)<-gsub('ME','',colnames(MEs))
+  if(!file.exists('figure'))
+    file.create('figure')
+  
+  ##make the eigen plot
+  png(paste0('figure/',label,'-PC1 of modules.png'),width = 14,height = 6.5,res = 600,units = 'in')
+  layout(eigen.layout)
+  sapply(sort(unique(clusters)),function(x){
+    
+    module.genes<-names(clusters)[clusters==x]
+    module.data<-data2ana[,module.genes]
+    module.color<-colorOrder[x]
+    ##make the plot
+    matplot(module.data,type='l',col=color.darken(module.color),lty = 1,
+            main=paste0('Module ',x,', Gene=',length(module.genes),' (Var.pc1=',varExplained[x],')'),
+            ylab='Z-score')
+    if(module.color=='black')
+      matlines(MEs[,x],col='white',lwd = 2) else matlines(MEs[,x],col='black',lwd = 2)
+  })
+  dev.off()
+  
+  ##correlation analysis
+  MEs<-eigen$eigengenes
+  colnames(MEs) <- gsub('ME','',colnames(MEs))
+  
+  module.cor<-Hmisc::rcorr(as.matrix(MEs),type = cor.method)
+  p.mat<-module.cor$P
+  png(paste0('figure/',label,'-correlation matrix.png'),width = 5,height = 5,res = 600,units = 'in')
+  corrplot(module.cor$r, type="upper", order="hclust", 
+           p.mat = p.mat, sig.level = sig.level, insig = "blank",
+           hclust.method = 'ward.D',title=paste0('Correlation of PC1, p<',sig.level),mar=c(0,0,0.8,0),cl.ratio=0.2)
+  dev.off()
+  
+  
+  
+  module.cor$r[module.cor$P>sig.level]<-0
+  diag(module.cor$r)<-0
+  
+  png(paste0('figure/',label,'-correlation network.png'),width = 5,height = 5,res = 600,units = 'in')
+  qgraph(module.cor$r,edge.labels = TRUE,layout = "spring",esize=8,vsize=4)
+  title(paste0("Co-expression network of Modules, p<",sig.level),line=3,cex.main=1)
+  dev.off()
+  return(list(eigen=eigen,module.cor=module.cor))
+}
+
+#############################################################################
+trait.analysis<-function(data2ana,clusters,traits,hclust.method='average',label='DAS',cor.method = 'spearman'){
+  message('Analysing module association to traits ...')
+  ##Association to traits
+  sampleTree2 = hclust(dist(data2ana), method = hclust.method)
+  # Convert traits to a color representation: white means low, red means high, grey means missing entry
+  traitColors = numbers2colors(traits, signed = FALSE);
+  # Plot the sample dendrogram and the colors underneath.
+  png(paste0('figure/',label,'-Sample dendrogram and trait heatmap.png'),width=7,height=5,res=600,units = 'in')
+  plotDendroAndColors(sampleTree2, traitColors,groupLabels = names(traits),
+                      main = "Sample dendrogram and trait heatmap")
+  dev.off()
+  
+  
+  # Define numbers of genes and samples
+  nGenes = ncol(data2ana);
+  nSamples = nrow(data2ana);
+  # Recalculate MEs with color labels
+  MEs0 = moduleEigengenes(data2ana, clusters)$eigengenes
+  colnames(MEs0)<-gsub('ME','',colnames(MEs0))
+
+  MEs = orderMEs(MEs0)
+  moduleTraitCor = cor(MEs, traits, use = "p",method = cor.method);
+  moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples);
+  
+  # Will display correlations and their p-values
+  textMatrix = paste(signif(moduleTraitCor, 2), "\n(",
+                     round(moduleTraitPvalue, 5), ")", sep = "");
+  dim(textMatrix) = dim(moduleTraitCor)
+  
+  
+  
+  png(paste0('figure/',label,'-Module-trait relationships.png'),width=6,height=7,res=600,units = 'in')
+  par(mar = c(5, 2, 3, 2));
+  # Display the correlation values within a heatmap plot
+  labeledHeatmap(Matrix = moduleTraitCor,
+                 xLabels = colnames(moduleTraitCor),
+                 yLabels = rownames(moduleTraitCor),
+                 ySymbols = names(MEs),
+                 colorLabels = FALSE,
+                 colors = greenWhiteRed(50,warn = F),
+                 textMatrix = textMatrix,
+                 setStdMargins = FALSE,
+                 cex.text = 0.75,
+                 zlim = c(-1,1),
+                 main = paste("Module-trait relationships\n Spearman correlation, p-value"))
+  dev.off()
+  
+}
+
+
+```
+
+# Session Information
+```{r session, echo=FALSE,eval=T}
+sessionInfo()
+
+```
