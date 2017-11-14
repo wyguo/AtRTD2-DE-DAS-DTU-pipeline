@@ -1,4 +1,5 @@
-# AtRTD2-DE-DAS-DTU-pipeline
+# DE/DAS/DTU pipeline for RNA-seq data of Arabidopsis in response to cold
+
 The R source code of differential expression (DE), differential alternative splicing (DAS) and differential transcript usage (DTU) analysis pipeline for the paper “Rapid and dynamic alternative splicing impacts the Arabidopsis cold response” is in the file "DE and DAS analysis R codes for AtRTD2 RNA-seq.Rmd" 
 
 
