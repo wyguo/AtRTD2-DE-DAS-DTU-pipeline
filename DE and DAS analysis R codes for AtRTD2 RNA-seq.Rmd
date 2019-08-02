@@ -302,7 +302,7 @@ length(DE_genes)
 
 DE_DAS_results$DE_genes_indicator <- indicator
 DE_DAS_results$DE_genes <- DE_genes
-DE_DAS_results$DAS_genes <- DE_summary$DAS_genes
+DE_DAS_results$DAS_genes <- DAS_genes
 ```
 
 ### DE transcripts
@@ -389,12 +389,11 @@ genes_2trans <- names(idx)[idx>1]
 length(genes_2trans)
 
 label <- 'DAS_all'
-trans <- DE_summary$TSIS_trans
-# idx.max <- apply(PSI,1,max)
-# idx.max <-rownames(PSI)[idx.max>=0.2]
-# trans <- intersect(trans,idx.max)
+idx.max <- apply(PSI,1,max)
+idx.max <-rownames(PSI)[idx.max>=0.2]
+trans <- intersect(trans,idx.max)
 
-genes<-DE_summary$DAS_genes
+genes<-DAS_genes
 length(genes)
 length(intersect(genes,genes_2trans))
 
@@ -474,7 +473,7 @@ leg<-rowAnnotation(ann,col = list(day = c("20_Day0"=color2day[1],
 
 ###--Build basic of wgcna---###
 rm('data2plot')
-# DAS_trans <- DE_summary$TSIS_trans_cut0.2
+
 length(DAS_trans)
 data2plot<-txi_trans$abundance[DAS_trans,]
 ##take average of replicates for each gene
