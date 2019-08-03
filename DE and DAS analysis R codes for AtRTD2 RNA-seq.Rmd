@@ -302,7 +302,7 @@ length(DE_genes)
 
 DE_DAS_results$DE_genes_indicator <- indicator
 DE_DAS_results$DE_genes <- DE_genes
-DE_DAS_results$DAS_genes <- DAS_genes
+
 ```
 
 ### DE transcripts
@@ -327,6 +327,38 @@ length(DE_trans)
 
 DE_DAS_results$DE_trans_indicator <- indicator
 DE_DAS_results$DE_trans <- DE_trans
+```
+
+### DAS genes
+```{r}
+genes.idx <- rownames(DE_results_trans$DAS.list.F[[1]])
+pval <- lapply(DE_results_trans$DAS.list.F,function(x){
+  x <- x[genes.idx,]
+  x$FDR
+})
+pval <- do.call(cbind,pval)
+rownames(pval) <- genes.idx
+
+####maximum deltaPS
+colnames(deltaPSI) <- colnames(pval)
+MaxdeltaPS <- by(deltaPSI,INDICES = substr(rownames(deltaPSI),1,9),FUN = function(x){
+  apply(abs(x),2,max)
+})
+MaxdeltaPS <- do.call(rbind,MaxdeltaPS)
+MaxdeltaPS <- MaxdeltaPS[genes.idx,]
+
+###
+indicator <- (pval<0.01)+(abs(MaxdeltaPS)>0.1)
+indicator[indicator==1] <- 0
+indicator <- indicator/2
+indicator[1:10,1:3]
+colSums(indicator)
+
+##---DAS genes
+idx<-apply(indicator[,-1],1,function(x) value.counts(x,value = 1,consecutive = T))
+DAS_genes<-names(idx)[idx]
+length(DAS_genes)
+DE_DAS_results$DAS_genes <- DAS_genes
 ```
 
 ### DAS transcripts
